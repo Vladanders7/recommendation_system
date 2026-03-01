@@ -12,9 +12,6 @@ artifacts/*.pkl
 artifacts/*.joblib
 artifacts/*.bin
 
-# Data
-data/
-
 # OS
 .DS_Store
 Thumbs.db

@@ -2,14 +2,14 @@ from __future__ import annotations
 
 # ===== Imports =====
 import os
-from typing import List
+from typing import List, Optional
+from datetime import datetime
 
 import pandas as pd
 from sqlalchemy import create_engine, text
 
 from catboost import CatBoostClassifier, Pool
 from fastapi import FastAPI, HTTPException, Query
-from datetime import datetime
 
 # --- fallback схема PostGet (в чекере импортируется из schema) ---
 try:
@@ -26,12 +26,6 @@ except Exception:
 # =====================
 # CONFIG
 # =====================
-DB_URL = (
-    "postgresql://robot-startml-ro:pheiph0hahj1Vaif@"
-    "postgres.lab.karpov.courses:6432/startml"
-)
-engine = create_engine(DB_URL, pool_pre_ping=True)
-
 USER_TABLE = "vladislav_andreev_user_features_lesson_22"
 POST_TABLE = "vladislav_andreev_post_features_lesson_22"
 
@@ -41,6 +35,14 @@ POST_TABLE = "vladislav_andreev_post_features_lesson_22"
 # 1 = load from Postgres (as in checker), 0 = load from local CSV samples
 USE_DB = (os.environ.get("IS_LMS") == "1") or (os.getenv("USE_DB", "0") == "1")
 DATA_DIR = os.getenv("DATA_DIR", "data/sample")
+
+# DB config (ONLY for DB mode)
+DB_URL = os.getenv("DATABASE_URL")
+engine: Optional[object] = None
+if USE_DB:
+    if not DB_URL:
+        raise RuntimeError("DATABASE_URL env var is required in DB mode (USE_DB=1 or IS_LMS=1).")
+    engine = create_engine(DB_URL, pool_pre_ping=True)
 
 # Порядок и типы признаков — как в обучении
 CAT_COLS = [
@@ -61,12 +63,13 @@ TOP_CANDIDATES = 2000      # пул кандидатов (баланс скор�
 def get_model_path(_: str) -> str:
     """
     In LMS checker model file is available at /workdir/user_input/model.
-    Locally we expect it at artifacts/model.cbm (not committed to Git).
+    Locally we expect it at artifacts/model.cbm.
     You can override via MODEL_PATH env var.
     """
     if os.environ.get("IS_LMS") == "1":
         return "/workdir/user_input/model"
     return os.getenv("MODEL_PATH", "artifacts/model.cbm")
+
 
 def load_models() -> CatBoostClassifier:
     model_path = get_model_path("")
@@ -84,8 +87,9 @@ def load_models() -> CatBoostClassifier:
 # =====================
 def batch_load_sql(query: str, chunksize: int = 200_000) -> pd.DataFrame:
     """Читаем большие таблицы из БД чанками, чтобы не взорвать память."""
-    eng = create_engine(DB_URL, pool_pre_ping=True)
-    conn = eng.connect().execution_options(stream_results=True)
+    if not USE_DB or engine is None:
+        raise RuntimeError("batch_load_sql called in local mode. Set USE_DB=1 and DATABASE_URL.")
+    conn = engine.connect().execution_options(stream_results=True)
     parts = []
     try:
         for part in pd.read_sql(query, conn, chunksize=chunksize):
@@ -94,141 +98,66 @@ def batch_load_sql(query: str, chunksize: int = 200_000) -> pd.DataFrame:
         conn.close()
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
+
 def fetch_posts_texts(post_ids: list[int]) -> pd.DataFrame:
     """Достаём text/topic из исходной post_text_df для нужных post_id (батчами)."""
     if not post_ids:
         return pd.DataFrame(columns=["post_id", "text", "topic"])
+    if engine is None:
+        raise RuntimeError("fetch_posts_texts requires DB mode engine.")
+
     out = []
     step = 50_000
     with engine.begin() as conn:
         conn.execute(text("SET statement_timeout = 120000"))
         for i in range(0, len(post_ids), step):
-            chunk = post_ids[i : i + step]
+            chunk = post_ids[i: i + step]
             df = pd.read_sql(
                 text("SELECT post_id, text, topic FROM post_text_df WHERE post_id = ANY(:ids)"),
                 conn,
                 params={"ids": chunk},
             )
             out.append(df)
+
     return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=["post_id", "text", "topic"])
 
 # =====================
 # Loaders (DB or local CSV)
 # =====================
-
 def load_user_feats() -> pd.DataFrame:
+    """
+    В local-mode читаем уже подготовленную витрину user_features.csv
+    (чтобы local inference = DB inference по источнику фич).
+    """
     if USE_DB:
         df = batch_load_sql(f"""
             SELECT user_id, age, city, country, exp_group, gender, os, source
             FROM {USER_TABLE}
         """)
     else:
-        df = pd.read_csv(os.path.join(DATA_DIR, "user_data_sample.csv"))
+        df = pd.read_csv(os.path.join(DATA_DIR, "user_features.csv"))
 
     df["user_id"] = df["user_id"].astype(int)
     return df
 
 
-def compute_post_ctr_smooth(feed_df: pd.DataFrame, alpha: float = 50.0) -> pd.DataFrame:
-    """
-    Считаем сглаженный CTR поста из feed-логов.
-
-    Ожидаемые поля в feed_df:
-      - post_id
-      - action ('view' / 'like')
-      - target (для view: 1 если был быстрый лайк, иначе 0)
-
-    impressions = кол-во view
-    likes       = сумма target по view
-    smooth CTR  = (likes + alpha * global_ctr) / (impressions + alpha)
-    """
-    f = feed_df.copy()
-
-    # нормализуем названия на всякий случай (вдруг в файле id вместо post_id)
-    if "post_id" not in f.columns and "post" in f.columns:
-        f = f.rename(columns={"post": "post_id"})
-    if "post_id" not in f.columns and "id" in f.columns:
-        f = f.rename(columns={"id": "post_id"})
-
-    if "post_id" not in f.columns:
-        raise RuntimeError("feed_sample_lastNdays.csv must contain 'post_id' column")
-
-    # работаем только с просмотрами
-    if "action" in f.columns:
-        f = f[f["action"] == "view"].copy()
-
-    # target должен быть 0/1, NaN выкидываем
-    if "target" not in f.columns:
-        raise RuntimeError("feed_sample_lastNdays.csv must contain 'target' column (for views)")
-
-    f["target"] = pd.to_numeric(f["target"], errors="coerce")
-    f = f.dropna(subset=["target"]).copy()
-    f["target"] = f["target"].astype(int)
-
-    agg = f.groupby("post_id", as_index=False).agg(
-        impressions=("target", "size"),
-        likes=("target", "sum"),
-    )
-
-    total_impr = int(agg["impressions"].sum())
-    total_likes = int(agg["likes"].sum())
-    global_ctr = (total_likes / total_impr) if total_impr > 0 else 0.0
-
-    agg["post_ctr_smooth"] = (agg["likes"] + alpha * global_ctr) / (agg["impressions"] + alpha)
-    return agg[["post_id", "post_ctr_smooth"]]
-
-
 def load_post_feats() -> pd.DataFrame:
+    """
+    В local-mode читаем уже подготовленную витрину post_features.csv
+    и НЕ считаем CTR внутри сервиса.
+    """
     if USE_DB:
         df = batch_load_sql(f"""
             SELECT post_id, topic, text_len, post_ctr_smooth
             FROM {POST_TABLE}
         """)
-        df["post_id"] = df["post_id"].astype(int)
-        return df
-
-    # ===== local CSV mode =====
-    posts = pd.read_csv(os.path.join(DATA_DIR, "post_text_sample.csv"))
-
-    # иногда посты приходят с колонкой "id"
-    if "post_id" not in posts.columns and "id" in posts.columns:
-        posts = posts.rename(columns={"id": "post_id"})
-
-    if "post_id" not in posts.columns:
-        raise RuntimeError("post_text_sample.csv must contain 'post_id' (or 'id') column")
-
-    if "topic" not in posts.columns:
-        posts["topic"] = "UNK"
-
-    # text_len
-    if "text_len" not in posts.columns:
-        if "text" in posts.columns:
-            posts["text_len"] = posts["text"].fillna("").astype(str).str.len()
-        else:
-            posts["text_len"] = 0
-
-    posts["post_id"] = posts["post_id"].astype(int)
-    posts["text_len"] = pd.to_numeric(posts["text_len"], errors="coerce").fillna(0).astype(float)
-    posts["topic"] = posts["topic"].astype(str).fillna("UNK")
-
-    # CTR из feed_sample_lastNdays.csv
-    feed_path = os.path.join(DATA_DIR, "feed_sample_lastNdays.csv")
-    feed = pd.read_csv(feed_path)
-
-    ctr = compute_post_ctr_smooth(feed, alpha=50.0)
-    ctr["post_id"] = ctr["post_id"].astype(int)
-
-    # мерджим CTR к постам
-    posts = posts.merge(ctr, on="post_id", how="left")
-
-    # если для какого-то post_id нет статистики в feed_sample — заполним медианой/0
-    if posts["post_ctr_smooth"].notna().any():
-        fill_val = float(posts["post_ctr_smooth"].median())
     else:
-        fill_val = 0.0
-    posts["post_ctr_smooth"] = pd.to_numeric(posts["post_ctr_smooth"], errors="coerce").fillna(fill_val).astype(float)
+        df = pd.read_csv(os.path.join(DATA_DIR, "post_features.csv"))
 
-    df = posts[["post_id", "topic", "text_len", "post_ctr_smooth"]].copy()
+    df["post_id"] = df["post_id"].astype(int)
+    df["topic"] = df["topic"].astype(str).fillna("UNK")
+    df["text_len"] = pd.to_numeric(df["text_len"], errors="coerce").fillna(0).astype(float)
+    df["post_ctr_smooth"] = pd.to_numeric(df["post_ctr_smooth"], errors="coerce").fillna(0).astype(float)
     return df
 
 
@@ -252,7 +181,6 @@ def load_post_texts(post_ids: list[int]) -> pd.DataFrame:
     df["post_id"] = df["post_id"].astype(int)
     return df[["post_id", "text", "topic"]].copy()
 
-
 # =====================
 # Cold-start helpers
 # =====================
@@ -268,6 +196,7 @@ def make_default_user_row(user_id: int) -> pd.DataFrame:
         "os": "UNK",
         "source": "UNK",
     }])
+
 
 def get_user_row(user_id: int, user_tbl: pd.DataFrame) -> pd.DataFrame:
     r = user_tbl[user_tbl["user_id"] == user_id]
@@ -321,6 +250,7 @@ CAND_BASE["post_ctr_smooth"] = pd.to_numeric(CAND_BASE["post_ctr_smooth"], error
 
 # 6) Ручной кэш профилей пользователей (без functools)
 USER_ROW_CACHE: dict[int, pd.DataFrame] = {}
+
 def get_user_row_cached(user_id: int) -> pd.DataFrame:
     r = USER_ROW_CACHE.get(user_id)
     if r is not None:
@@ -335,7 +265,6 @@ def get_user_row_cached(user_id: int) -> pd.DataFrame:
 def build_predict_matrix(user_id: int, when: datetime) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Профиль пользователя (кэш) × кандидаты (кэш) × контекст (час/день) → X.
-    Всё приведение типов сделано на старте; здесь только вставляем hour/dow.
     """
     # профиль
     u = get_user_row_cached(user_id)  # 1 строка, уже с нужными типами
