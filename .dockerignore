@@ -5,3 +5,8 @@ __pycache__
 .gitignore
 notebooks
 data/sample
+artifacts/*.cbm
+artifacts/*.pkl
+artifacts/*.joblib
+artifacts/*.bin
+venv
